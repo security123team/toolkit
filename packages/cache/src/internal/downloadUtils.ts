@@ -1,6 +1,5 @@
 import * as core from '@actions/core'
-import {HttpClient} from '@actions/http-client'
-import {IHttpClientResponse} from '@actions/http-client/interfaces'
+import {HttpClient, HttpClientResponse} from '@actions/http-client'
 import {BlockBlobClient} from '@azure/storage-blob'
 import {TransferProgressEvent} from '@azure/ms-rest-js'
 import * as buffer from 'buffer'
@@ -13,6 +12,8 @@ import {SocketTimeout} from './constants'
 import {DownloadOptions} from '../options'
 import {retryHttpClientResponse} from './requestUtils'
 
+import {AbortController} from '@azure/abort-controller'
+
 /**
  * Pipes the body of a HTTP response to a stream
  *
@@ -20,7 +21,7 @@ import {retryHttpClientResponse} from './requestUtils'
  * @param output the writable stream
  */
 async function pipeResponseToStream(
-  response: IHttpClientResponse,
+  response: HttpClientResponse,
   output: NodeJS.WritableStream
 ): Promise<void> {
   const pipeline = util.promisify(stream.pipeline)
@@ -240,14 +241,16 @@ export async function downloadCacheStorageSDK(
     //
     // If the file exceeds the buffer maximum length (~1 GB on 32-bit systems and ~2 GB
     // on 64-bit systems), split the download into multiple segments
-    const maxSegmentSize = buffer.constants.MAX_LENGTH
+    // ~2 GB = 2147483647, beyond this, we start getting out of range error. So, capping it accordingly.
+    const maxSegmentSize = Math.min(2147483647, buffer.constants.MAX_LENGTH)
     const downloadProgress = new DownloadProgress(contentLength)
 
     const fd = fs.openSync(archivePath, 'w')
 
     try {
       downloadProgress.startDisplayTimer()
-
+      const controller = new AbortController()
+      const abortSignal = controller.signal
       while (!downloadProgress.isDone()) {
         const segmentStart =
           downloadProgress.segmentOffset + downloadProgress.segmentSize
@@ -258,21 +261,41 @@ export async function downloadCacheStorageSDK(
         )
 
         downloadProgress.nextSegment(segmentSize)
-
-        const result = await client.downloadToBuffer(
-          segmentStart,
-          segmentSize,
-          {
+        const result = await promiseWithTimeout(
+          options.segmentTimeoutInMs || 3600000,
+          client.downloadToBuffer(segmentStart, segmentSize, {
+            abortSignal,
             concurrency: options.downloadConcurrency,
             onProgress: downloadProgress.onProgress()
-          }
+          })
         )
-
-        fs.writeFileSync(fd, result)
+        if (result === 'timeout') {
+          controller.abort()
+          throw new Error(
+            'Aborting cache download as the download time exceeded the timeout.'
+          )
+        } else if (Buffer.isBuffer(result)) {
+          fs.writeFileSync(fd, result)
+        }
       }
     } finally {
       downloadProgress.stopDisplayTimer()
       fs.closeSync(fd)
     }
   }
+}
+
+const promiseWithTimeout = async (
+  timeoutMs: number,
+  promise: Promise<Buffer>
+): Promise<unknown> => {
+  let timeoutHandle: NodeJS.Timeout
+  const timeoutPromise = new Promise(resolve => {
+    timeoutHandle = setTimeout(() => resolve('timeout'), timeoutMs)
+  })
+
+  return Promise.race([promise, timeoutPromise]).then(result => {
+    clearTimeout(timeoutHandle)
+    return result
+  })
 }
